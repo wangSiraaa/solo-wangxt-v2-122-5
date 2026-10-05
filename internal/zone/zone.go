@@ -125,6 +125,45 @@ func (s *Snapshot) lookupName(name string) ([]dns.RR, bool) {
 	return rrs, ok
 }
 
+// AuthoritativeReply builds the exact reply the live server would send for
+// request q, served from snapshot s: AA=1, RA=0, answers from Lookup
+// (including the CNAME chase), and an SOA in the authority section with the
+// RFC 2308 negative TTL for NXDOMAIN (name does not exist) or NODATA (name
+// exists, no record of the requested type, including empty non-terminals).
+//
+// Callers must apply the out-of-zone gate (REFUSED) before calling, just as
+// the server does; this function assumes qname is within s.Origin and
+// q.Qclass is IN. Both the UDP/TCP handler and the offline version-query
+// command go through here so their semantics cannot drift apart.
+func (s *Snapshot) AuthoritativeReply(q dns.Question) *dns.Msg {
+	r := new(dns.Msg)
+	r.Id = 0 // a request-like template; dns writes replace the id on the wire
+	r.Response = true
+	r.Opcode = dns.OpcodeQuery
+	r.Question = []dns.Question{q}
+	r.Rcode = dns.RcodeSuccess
+	r.Authoritative = true
+	r.RecursionAvailable = false
+
+	qname := strings.ToLower(q.Name)
+	answers, nameExists := s.Lookup(qname, q.Qtype)
+	r.Answer = answers
+	if len(answers) > 0 {
+		return r
+	}
+
+	negativeSOA := dns.Copy(s.SOA()).(*dns.SOA)
+	negativeSOA.Hdr.Ttl = s.NegativeTTL()
+	r.Ns = append(r.Ns, negativeSOA)
+	if !nameExists {
+		// Name-error proof chain: even when an ancestor of qname does not
+		// exist either, the answer is NXDOMAIN; the authority SOA marks it
+		// as an authoritative negative answer (RFC 2308).
+		r.Rcode = dns.RcodeNameError
+	}
+	return r
+}
+
 // matchWildcard implements RFC 4592 source-of-synthesis lookup: find the
 // closest encloser (the deepest concrete ancestor name of qname; the
 // apex always counts as concrete because it holds SOA/NS), then test

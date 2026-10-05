@@ -135,6 +135,7 @@ func (s *Store) ListVersions(ctx context.Context, limit int) ([]PublishedVersion
 }
 
 // LoadSnapshot reconstructs an immutable snapshot for the given serial.
+// It returns ErrNoVersion when serial is not a published version.
 func (s *Store) LoadSnapshot(ctx context.Context, serial uint32) (*zone.Snapshot, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT rr_text FROM zone_records WHERE serial = $1 ORDER BY position`, int64(serial))
@@ -147,7 +148,7 @@ func (s *Store) LoadSnapshot(ctx context.Context, serial uint32) (*zone.Snapshot
 		return nil, err
 	}
 	if len(rrs) == 0 {
-		return nil, fmt.Errorf("version %d not found", serial)
+		return nil, fmt.Errorf("version %d: %w", serial, ErrNoVersion)
 	}
 	return zone.NewSnapshot(s.origin, serial, rrs)
 }
@@ -330,6 +331,24 @@ func (s *Store) VersionExists(ctx context.Context, serial uint32) (bool, error) 
 	err := s.pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM zone_versions WHERE serial=$1)`, int64(serial)).Scan(&exists)
 	return exists, err
+}
+
+// VersionInfo returns metadata for one published version. It returns
+// ErrNoVersion when serial is not a published version.
+func (s *Store) VersionInfo(ctx context.Context, serial uint32) (*PublishedVersion, error) {
+	var v PublishedVersion
+	var n int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT serial, published_at, note FROM zone_versions WHERE serial=$1`,
+		int64(serial)).Scan(&n, &v.PublishedAt, &v.Note)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("version %d: %w", serial, ErrNoVersion)
+	}
+	if err != nil {
+		return nil, err
+	}
+	v.Serial = uint32(n)
+	return &v, nil
 }
 
 type rowScanner interface {

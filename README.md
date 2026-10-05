@@ -33,10 +33,12 @@ internet:
 ## Layout
 
 ```
-cmd/dnszone/         CLI: serve / publish / versions
+cmd/dnszone/         CLI: serve / publish / versions / query
 internal/config/     JSON config (listeners, TTL bounds, ACL, TSIG keys)
 internal/zone/       master-file parsing, validation, immutable snapshots,
-                     lookup (CNAME chase + wildcards), version diffing
+                     lookup (CNAME chase + wildcards) + authoritative reply,
+                     version diffing
+internal/query/      offline version query: type/name parsing, reply rendering
 internal/store/      PostgreSQL: versions, records, change log, LISTEN notify
 internal/server/     DNS handler: queries + AXFR/IXFR, TSIG/ACL gating
 scripts/             postgres bootstrap and dig verification
@@ -84,6 +86,28 @@ testdata/            example zones and a TSIG key file
    dig @127.0.0.1 -p 5354 -k testdata/tsig.key lab.test. AXFR +tcp
    dig @127.0.0.1 -p 5354 -k testdata/tsig.key lab.test. IXFR=1 +tcp
    ```
+
+5. Reconstruct what an older version *would have answered*, offline,
+   when triaging a client report. The command reads only the persisted
+   snapshot from PostgreSQL: it sends no DNS packets, does not recurse
+   and never changes the version the live server is serving:
+
+   ```sh
+   ./bin/dnszone query -config config.json -version 1 -name www.lab.test -type A
+   ./bin/dnszone query -config config.json -version 2 -name www.lab.test -type MX
+   ./bin/dnszone query -config config.json -version current -name alias -type CNAME
+   ```
+
+   The report renders the authoritative reply exactly as the live
+   handler would for that version (both call the same lookup code):
+   answer records with CNAME-chain following (in-zone targets chased,
+   out-of-zone targets stop at the zone cut), `NXDOMAIN` versus
+   `NODATA` with the RFC 2308 `min(SOA TTL, SOA MINIMUM)` negative
+   TTL shown on the authority SOA, and `REFUSED`/`RA=0` for names
+   outside the zone. Names may be relative to the zone (`www`, `@`)
+   or absolute (`example.com.`); types accept names (`AAAA`, `ANY`)
+   or numeric codes. A nonexistent version lists the versions that do
+   exist and states which one is currently being served.
 
 ## Configuration (`config.json`)
 
