@@ -63,13 +63,40 @@ func (s *Snapshot) buildIndex() {
 	}
 }
 
+// CNAMEHop records one CNAME encountered by LookupTrace and whether the
+// authoritative snapshot followed it. Targets inside the zone are followed;
+// targets outside it are returned but never chased because this server does
+// not recurse.
+type CNAMEHop struct {
+	From     string
+	To       string
+	Followed bool
+}
+
+// LookupTrace contains the answer path for a query, including the CNAME
+// redirects traversed before the terminal name.
+type LookupTrace struct {
+	Answers    []dns.RR
+	NameExists bool
+	FinalName  string
+	CNAMEHops  []CNAMEHop
+	Stopped    string
+}
+
 // Lookup returns all records at name of the given qtype, following up to
 // eight CNAME hops, along with the records in traversal order. qtype TypeANY
 // returns every record at the name. Wildcards (RFC 4592) are consulted.
 // The returned found flag distinguishes NXDOMAIN (name does not exist)
 // from NODATA (name exists, no record of the requested type).
 func (s *Snapshot) Lookup(qname string, qtype uint16) (answers []dns.RR, found bool) {
+	trace := s.LookupTrace(qname, qtype)
+	return trace.Answers, trace.NameExists
+}
+
+// LookupTrace is Lookup with the CNAME path retained for diagnostic output.
+func (s *Snapshot) LookupTrace(qname string, qtype uint16) LookupTrace {
 	name := strings.ToLower(qname)
+	trace := LookupTrace{FinalName: name}
 	seen := map[string]bool{}
 	for hops := 0; hops <= 8; hops++ {
 		direct, directExists := s.lookupName(name)
@@ -84,13 +111,13 @@ func (s *Snapshot) Lookup(qname string, qtype uint16) (answers []dns.RR, found b
 				rrs = append(rrs, cp)
 			}
 		} else {
-			return answers, found
+			return trace
 		}
-		found = true
+		trace.NameExists = true
 
 		if qtype == dns.TypeANY {
-			answers = append(answers, rrs...)
-			return
+			trace.Answers = append(trace.Answers, rrs...)
+			return trace
 		}
 		var matched []dns.RR
 		var cname *dns.CNAME
@@ -103,21 +130,85 @@ func (s *Snapshot) Lookup(qname string, qtype uint16) (answers []dns.RR, found b
 			}
 		}
 		if len(matched) > 0 {
-			answers = append(answers, matched...)
-			return
+			trace.Answers = append(trace.Answers, matched...)
+			return trace
 		}
-		if qtype == dns.TypeCNAME || cname == nil || seen[name] {
-			return
+		if qtype == dns.TypeCNAME || cname == nil {
+			return trace
+		}
+		if seen[name] {
+			trace.Stopped = "CNAME loop detected"
+			return trace
 		}
 		seen[name] = true
-		answers = append(answers, cname)
-		name = strings.ToLower(cname.Target)
-		if !dns.IsSubDomain(s.Origin, name) {
+		target := strings.ToLower(cname.Target)
+		inZone := dns.IsSubDomain(s.Origin, target)
+		trace.Answers = append(trace.Answers, cname)
+		trace.CNAMEHops = append(trace.CNAMEHops, CNAMEHop{
+			From:     name,
+			To:       target,
+			Followed: inZone,
+		})
+		trace.FinalName = target
+		if !inZone {
 			// Target outside the zone; the server cannot chase it.
-			return
+			trace.Stopped = "target outside zone"
+			return trace
 		}
+		name = target
 	}
-	return
+	trace.Stopped = "CNAME chain limit reached"
+	return trace
+}
+
+// QueryResult is the protocol-independent authoritative outcome for one
+// standard IN-class query. The DNS server maps it directly onto a wire
+// response; offline diagnostic commands use the same result.
+type QueryResult struct {
+	Rcode              int
+	Authoritative      bool
+	RecursionAvailable bool
+	Answers            []dns.RR
+	Authority          []dns.RR
+	NameExists         bool
+	Trace              LookupTrace
+}
+
+// Resolve applies the same in-zone, negative-answer and CNAME rules used by
+// the serving DNS handler. It never performs recursion or network I/O.
+func (s *Snapshot) Resolve(qname string, qtype uint16, qclass uint16) QueryResult {
+	qname = strings.ToLower(qname)
+	result := QueryResult{
+		Rcode:              dns.RcodeRefused,
+		RecursionAvailable: false,
+		Trace:              LookupTrace{FinalName: qname},
+	}
+	if qclass != dns.ClassINET {
+		return result
+	}
+	if !dns.IsSubDomain(s.Origin, qname) {
+		return result
+	}
+
+	result.Authoritative = true
+	result.Rcode = dns.RcodeSuccess
+	result.Trace = s.LookupTrace(qname, qtype)
+	result.Answers = result.Trace.Answers
+	result.NameExists = result.Trace.NameExists
+	if len(result.Answers) > 0 {
+		return result
+	}
+
+	soa := s.SOA()
+	negativeSOA := dns.Copy(soa).(*dns.SOA)
+	negativeSOA.Hdr.Ttl = s.NegativeTTL()
+	result.Authority = append(result.Authority, negativeSOA)
+	if !result.NameExists {
+		// NXDOMAIN: neither the qname nor a wildcard synthesis exists.
+		result.Rcode = dns.RcodeNameError
+	}
+	// Otherwise NODATA: name exists, no record of this type.
+	return result
 }
 
 func (s *Snapshot) lookupName(name string) ([]dns.RR, bool) {

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -87,6 +88,40 @@ www IN A 127.0.0.20
 	// SOA serial stored on the version must equal the snapshot serial.
 	if snap.SOA().Serial != 1 {
 		t.Fatal("SOA serial mismatch")
+	}
+}
+
+func TestOpenReadOnlyLoadsVersionWithoutChangingCurrent(t *testing.T) {
+	s := freshStore(t)
+	ctx := context.Background()
+	if _, err := s.Publish(ctx, parse(t, content(0)), "v1",
+		zone.Limits{MinTTL: 30, MaxTTL: 86400}); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	ro, err := OpenReadOnly(ctx, testDatabaseURL(), origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ro.Close)
+
+	snap, err := ro.LoadSnapshot(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Serial != 1 {
+		t.Fatalf("read-only snapshot serial = %d", snap.Serial)
+	}
+	if _, err := ro.LoadSnapshot(ctx, 99); !errors.Is(err, ErrNoVersion) {
+		t.Fatalf("missing version error = %v, want ErrNoVersion", err)
+	}
+	if _, err := ro.pool.Exec(ctx, `UPDATE zone_meta SET current_serial = 2`); err == nil {
+		t.Fatal("read-only connection allowed a write")
+	}
+	current, err := ro.CurrentSerial(ctx)
+	if err != nil || current != 1 {
+		t.Fatalf("current after rejected write = %d, %v; want 1", current, err)
 	}
 }
 

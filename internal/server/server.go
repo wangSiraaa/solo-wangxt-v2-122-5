@@ -205,51 +205,15 @@ func (s *Server) handleQuery(w dns.ResponseWriter, m *dns.Msg) {
 		refused(w, m)
 		return
 	}
-	qname := strings.ToLower(q.Name)
-	if q.Qclass != dns.ClassINET {
-		r := new(dns.Msg)
-		r.SetRcode(m, dns.RcodeRefused)
-		_ = w.WriteMsg(r)
-		return
-	}
-	if !dns.IsSubDomain(snap.Origin, qname) {
-		// Out of zone: authoritative REFUSED, and crucially no recursion
-		// is attempted (RA=0). Nothing is fetched from anywhere.
-		r := new(dns.Msg)
-		r.SetRcode(m, dns.RcodeRefused)
-		r.RecursionAvailable = false
-		_ = w.WriteMsg(r)
-		return
-	}
 
+	result := snap.Resolve(q.Name, q.Qtype, q.Qclass)
 	r := new(dns.Msg)
 	r.SetReply(m)
-	r.Authoritative = true
-	r.RecursionAvailable = false
-
-	answers, nameExists := snap.Lookup(qname, q.Qtype)
-	r.Answer = answers
-	if len(answers) > 0 {
-		s.write(w, r)
-		return
-	}
-
-	soa := snap.SOA()
-	negativeSOA := dns.Copy(soa).(*dns.SOA)
-	negativeSOA.Hdr.Ttl = snap.NegativeTTL()
-
-	if !nameExists {
-		// Prove NXDOMAIN with the name-error proof chain: if an ancestor of
-		// qname does not exist either, it is still NXDOMAIN; the SOA in
-		// authority marks it as an authoritative negative answer (RFC 2308).
-		r.Rcode = dns.RcodeNameError
-		r.Ns = append(r.Ns, negativeSOA)
-	} else {
-		// NODATA: name exists, no record of this type (also covers the
-		// empty non-terminal case).
-		r.Rcode = dns.RcodeSuccess
-		r.Ns = append(r.Ns, negativeSOA)
-	}
+	r.Rcode = result.Rcode
+	r.Authoritative = result.Authoritative
+	r.RecursionAvailable = result.RecursionAvailable
+	r.Answer = result.Answers
+	r.Ns = result.Authority
 	s.write(w, r)
 }
 

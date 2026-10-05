@@ -27,12 +27,8 @@ type Store struct {
 
 // New connects and ensures the schema exists.
 func New(ctx context.Context, url, origin string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, url)
+	pool, err := newPool(ctx, url, false)
 	if err != nil {
-		return nil, err
-	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
 		return nil, err
 	}
 	s := &Store{pool: pool, origin: dns.Fqdn(strings.ToLower(origin))}
@@ -41,6 +37,41 @@ func New(ctx context.Context, url, origin string) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// OpenReadOnly opens a connection for offline inspection without running
+// schema migrations or changing the current version pointer. PostgreSQL
+// rejects accidental writes for the session (SQLSTATE 25006).
+func OpenReadOnly(ctx context.Context, url, origin string) (*Store, error) {
+	pool, err := newPool(ctx, url, true)
+	if err != nil {
+		return nil, err
+	}
+	return &Store{pool: pool, origin: dns.Fqdn(strings.ToLower(origin))}, nil
+}
+
+func newPool(ctx context.Context, url string, readOnly bool) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, err
+	}
+	if readOnly {
+		// QueryRows without an explicit transaction run in the implicit
+		// transaction, so this runtime parameter also covers them.
+		if cfg.ConnConfig.RuntimeParams == nil {
+			cfg.ConnConfig.RuntimeParams = map[string]string{}
+		}
+		cfg.ConnConfig.RuntimeParams["default_transaction_read_only"] = "on"
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return pool, nil
 }
 
 // Close releases the pool.
@@ -134,8 +165,20 @@ func (s *Store) ListVersions(ctx context.Context, limit int) ([]PublishedVersion
 	return out, rows.Err()
 }
 
+// ErrNoVersion is returned when the requested version does not exist.
+var ErrNoVersion = errors.New("zone version not found")
+
 // LoadSnapshot reconstructs an immutable snapshot for the given serial.
 func (s *Store) LoadSnapshot(ctx context.Context, serial uint32) (*zone.Snapshot, error) {
+	var exists bool
+	if err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM zone_versions WHERE serial=$1)`, int64(serial)).
+		Scan(&exists); err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, fmt.Errorf("version %d: %w", serial, ErrNoVersion)
+	}
 	rows, err := s.pool.Query(ctx,
 		`SELECT rr_text FROM zone_records WHERE serial = $1 ORDER BY position`, int64(serial))
 	if err != nil {
@@ -320,9 +363,6 @@ func (s *Store) LoadChanges(ctx context.Context, serial uint32) ([]zone.Change, 
 	}
 	return out, rows.Err()
 }
-
-// ErrNoVersion is returned when the requested version does not exist.
-var ErrNoVersion = errors.New("zone version not found")
 
 // VersionExists reports whether serial is a published version.
 func (s *Store) VersionExists(ctx context.Context, serial uint32) (bool, error) {

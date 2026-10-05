@@ -6,6 +6,7 @@
 //	dnszone serve   --config config.json
 //	dnszone publish --config config.json --file zone.db [--note "..."]
 //	dnszone versions --config config.json
+//	dnszone query --config config.json --version N --name host --type A
 package main
 
 import (
@@ -37,6 +38,8 @@ func main() {
 		err = runPublish(args)
 	case "versions":
 		err = runVersions(args)
+	case "query", "offline-query":
+		err = runOfflineQuery(args)
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -56,6 +59,7 @@ Commands:
   serve     run the authoritative UDP/TCP server
   publish   atomically publish a zone file as a new version
   versions  list published zone versions
+  query     inspect a name/type in a persisted historical version
 
 Run "<command> -h" for command flags.
 `)

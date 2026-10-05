@@ -181,6 +181,115 @@ func TestDiffExcludesSOA(t *testing.T) {
 	}
 }
 
+func TestResolveAuthoritativeAnswersAndNegatives(t *testing.T) {
+	rrs := mustParse(t, validZone, Limits{MinTTL: 30, MaxTTL: 86400})
+	snap, _ := NewSnapshot("lab.test.", 1, rrs)
+
+	positive := snap.Resolve("www.lab.test.", dns.TypeA, dns.ClassINET)
+	if positive.Rcode != dns.RcodeSuccess || !positive.Authoritative || len(positive.Answers) != 2 {
+		t.Fatalf("positive result: %+v", positive)
+	}
+	if len(positive.Authority) != 0 || positive.RecursionAvailable {
+		t.Fatalf("positive answer must have no authority and RA=false: %+v", positive)
+	}
+
+	nodata := snap.Resolve("www.lab.test.", dns.TypeAAAA, dns.ClassINET)
+	if nodata.Rcode != dns.RcodeSuccess || !nodata.NameExists || len(nodata.Answers) != 0 {
+		t.Fatalf("NODATA result: %+v", nodata)
+	}
+	if len(nodata.Authority) != 1 || nodata.Authority[0].(*dns.SOA).Hdr.Ttl != 300 {
+		t.Fatalf("NODATA needs SOA authority with TTL 300: %+v", nodata.Authority)
+	}
+
+	nxdomain := snap.Resolve("missing.lab.test.", dns.TypeA, dns.ClassINET)
+	if nxdomain.Rcode != dns.RcodeNameError || nxdomain.NameExists || len(nxdomain.Answers) != 0 {
+		t.Fatalf("NXDOMAIN result: %+v", nxdomain)
+	}
+	if len(nxdomain.Authority) != 1 || nxdomain.Authority[0].(*dns.SOA).Hdr.Ttl != 300 {
+		t.Fatalf("NXDOMAIN needs SOA authority with TTL 300: %+v", nxdomain.Authority)
+	}
+
+	refused := snap.Resolve("example.com.", dns.TypeA, dns.ClassINET)
+	if refused.Rcode != dns.RcodeRefused || refused.Authoritative || len(refused.Authority) != 0 {
+		t.Fatalf("out-of-zone result must match online REFUSED: %+v", refused)
+	}
+
+	classRefused := snap.Resolve("www.lab.test.", dns.TypeA, dns.ClassCHAOS)
+	if classRefused.Rcode != dns.RcodeRefused || classRefused.Authoritative {
+		t.Fatalf("non-IN class result: %+v", classRefused)
+	}
+}
+
+func TestResolveCNAMETrace(t *testing.T) {
+	rrs := mustParse(t, validZone, Limits{MinTTL: 30, MaxTTL: 86400})
+	snap, _ := NewSnapshot("lab.test.", 1, rrs)
+
+	result := snap.Resolve("alias.lab.test.", dns.TypeA, dns.ClassINET)
+	if result.Rcode != dns.RcodeSuccess || len(result.Answers) != 3 {
+		t.Fatalf("internal CNAME answer: %+v", result)
+	}
+	if len(result.Trace.CNAMEHops) != 1 || !result.Trace.CNAMEHops[0].Followed {
+		t.Fatalf("internal CNAME hop not recorded as followed: %+v", result.Trace.CNAMEHops)
+	}
+	if result.Trace.FinalName != "www.lab.test." {
+		t.Fatalf("final name = %q", result.Trace.FinalName)
+	}
+
+	direct := snap.Resolve("alias.lab.test.", dns.TypeCNAME, dns.ClassINET)
+	if len(direct.Answers) != 1 || len(direct.Trace.CNAMEHops) != 0 {
+		t.Fatalf("direct CNAME query must return CNAME without chasing: %+v", direct.Trace)
+	}
+
+	externalText := strings.Replace(validZone,
+		"alias IN CNAME www.lab.test.",
+		"external IN CNAME target.example.net.", 1)
+	externalRRs := mustParse(t, externalText, Limits{MinTTL: 30, MaxTTL: 86400})
+	externalSnap, _ := NewSnapshot("lab.test.", 2, externalRRs)
+	external := externalSnap.Resolve("external.lab.test.", dns.TypeA, dns.ClassINET)
+	if external.Rcode != dns.RcodeSuccess || len(external.Answers) != 1 {
+		t.Fatalf("external CNAME answer: %+v", external)
+	}
+	if len(external.Trace.CNAMEHops) != 1 || external.Trace.CNAMEHops[0].Followed {
+		t.Fatalf("external CNAME must be returned and not followed: %+v", external.Trace.CNAMEHops)
+	}
+	if external.Trace.Stopped != "target outside zone" {
+		t.Fatalf("stop reason = %q", external.Trace.Stopped)
+	}
+}
+
+func TestResolveCNAMELoop(t *testing.T) {
+	text := strings.Replace(validZone,
+		"alias IN CNAME www.lab.test.",
+		"loop1 IN CNAME loop2.lab.test.\nloop2 IN CNAME loop1.lab.test.", 1)
+	rrs := mustParse(t, text, Limits{MinTTL: 30, MaxTTL: 86400})
+	snap, _ := NewSnapshot("lab.test.", 1, rrs)
+
+	result := snap.Resolve("loop1.lab.test.", dns.TypeA, dns.ClassINET)
+	if result.Rcode != dns.RcodeSuccess || len(result.Answers) != 2 {
+		t.Fatalf("CNAME loop result: %+v", result)
+	}
+	if result.Trace.Stopped != "CNAME loop detected" {
+		t.Fatalf("stop reason = %q, want loop", result.Trace.Stopped)
+	}
+}
+
+func TestResolveCanDistinguishVersions(t *testing.T) {
+	v1 := mustParse(t, validZone, Limits{MinTTL: 30, MaxTTL: 86400})
+	s1, _ := NewSnapshot("lab.test.", 1, v1)
+	v2Text := strings.Replace(validZone,
+		`www IN TXT "hello"`,
+		`www IN TXT "hello"
+www IN A 127.0.0.22`, 1)
+	v2 := mustParse(t, v2Text, Limits{MinTTL: 30, MaxTTL: 86400})
+	s2, _ := NewSnapshot("lab.test.", 2, v2)
+
+	r1 := s1.Resolve("www.lab.test.", dns.TypeA, dns.ClassINET)
+	r2 := s2.Resolve("www.lab.test.", dns.TypeA, dns.ClassINET)
+	if len(r1.Answers) != 2 || len(r2.Answers) != 3 {
+		t.Fatalf("version answers old=%d new=%d, want 2 and 3", len(r1.Answers), len(r2.Answers))
+	}
+}
+
 func TestAXFROrdering(t *testing.T) {
 	rrs := mustParse(t, validZone, Limits{MinTTL: 30, MaxTTL: 86400})
 	snap, _ := NewSnapshot("lab.test.", 1, rrs)

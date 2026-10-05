@@ -25,6 +25,11 @@ internet:
 - **Correct negative answers.** NXDOMAIN and NODATA are authoritative
   (`AA`) and carry the zone SOA in the authority section with TTL
   `min(SOA TTL, SOA MINIMUM)` per RFC 2308.
+- **Offline historical inspection.** The `query` command loads any
+  persisted serial through a read-only PostgreSQL connection and runs the
+  same authoritative lookup logic as the server. It makes no DNS network
+  requests, does not migrate the database, cannot write to it, and does not
+  change the currently served version.
 - **Validation at the edge.** TTLs outside the configured bounds,
   CNAME/other-record coexistence, duplicate CNAMEs, apex CNAMEs, and
   records whose owner is outside the zone are all rejected and the
@@ -33,7 +38,7 @@ internet:
 ## Layout
 
 ```
-cmd/dnszone/         CLI: serve / publish / versions
+cmd/dnszone/         CLI: serve / publish / versions / query
 internal/config/     JSON config (listeners, TTL bounds, ACL, TSIG keys)
 internal/zone/       master-file parsing, validation, immutable snapshots,
                      lookup (CNAME chase + wildcards), version diffing
@@ -84,6 +89,21 @@ testdata/            example zones and a TSIG key file
    dig @127.0.0.1 -p 5354 -k testdata/tsig.key lab.test. AXFR +tcp
    dig @127.0.0.1 -p 5354 -k testdata/tsig.key lab.test. IXFR=1 +tcp
    ```
+
+5. Inspect a historical version without touching the running server:
+
+   ```sh
+   ./bin/dnszone query -config config.json -version 1 -name www.lab.test. -type A
+   ./bin/dnszone query -config config.json -version 2 -name www.lab.test. -type A
+   ```
+
+   The report shows `ANSWER`, `NODATA`, `NXDOMAIN`, or `REFUSED`; the DNS
+   rcode; answer records; each CNAME hop and whether an in-zone target was
+   followed; and for negative answers the authority SOA plus its negative
+   TTL. Relative names and `@` are completed with the configured origin.
+   A name outside that origin is explained as the online server's
+   `REFUSED, RA=0` response; a missing serial reports that version does not
+   exist and identifies the current served version.
 
 ## Configuration (`config.json`)
 
